@@ -9,40 +9,88 @@ on:
         default: "1aAwd5dY5aozXDtqYZK_SNpd7-mIlZFCndJHZ8A0-lIg"
         type: string
       job_count:
-        description: "How many pages/jobs to run in parallel this cycle"
+        description: "How many pages/jobs to run in parallel this cycle (leave blank to run ALL active pages)"
         required: false
-        default: "3"
+        default: ""
         type: string
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────
-  # STAGE 1 — build the matrix [0,1,2,...,job_count-1] from the input.
-  # This is what lets you control "how many jobs" purely via a number,
-  # instead of hard-coding a matrix list in the YAML.
+  # STAGE 1 — build the matrix [0,1,2,...,N-1] for this run.
+  #
+  # If job_count is left blank, N = however many Active pages currently
+  # exist in the "Pages" tab (read live via fbpost.py --count-pages).
+  # If job_count is set, N = min(job_count, active page count) — you can
+  # never accidentally spin up more jobs than there are pages to run.
   # ────────────────────────────────────────────────────────────────────────
   prepare:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.build.outputs.matrix }}
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          pip install google-auth google-auth-httplib2 google-api-python-client
+
+      - name: Count active pages in sheet
+        id: count
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          CAPTIONS_SHEET_ID:       ${{ inputs.captions_sheet_id }}
+        run: |
+          python fbpost.py --count-pages | tee count_output.txt
+          ACTIVE=$(grep -oP '(?<=ACTIVE_PAGE_COUNT=)\d+' count_output.txt)
+          if [ -z "$ACTIVE" ]; then
+            echo "❌ Could not read ACTIVE_PAGE_COUNT from --count-pages output"
+            exit 1
+          fi
+          echo "active_count=$ACTIVE" >> "$GITHUB_OUTPUT"
+          echo "Active pages found in sheet: $ACTIVE"
+
       - name: Build job-index matrix
         id: build
         run: |
-          COUNT="${{ inputs.job_count }}"
-          if ! [[ "$COUNT" =~ ^[0-9]+$ ]] || [ "$COUNT" -lt 1 ]; then
-            echo "❌ job_count must be a positive integer, got '$COUNT'"
+          ACTIVE="${{ steps.count.outputs.active_count }}"
+          REQUESTED="${{ inputs.job_count }}"
+
+          if [ -z "$REQUESTED" ]; then
+            COUNT="$ACTIVE"
+            echo "job_count left blank — running all $ACTIVE active page(s)"
+          else
+            if ! [[ "$REQUESTED" =~ ^[0-9]+$ ]] || [ "$REQUESTED" -lt 1 ]; then
+              echo "❌ job_count must be a positive integer, or blank to run all active pages. Got '$REQUESTED'"
+              exit 1
+            fi
+            if [ "$REQUESTED" -gt "$ACTIVE" ]; then
+              echo "⚠️  job_count ($REQUESTED) exceeds active page count ($ACTIVE) — capping to $ACTIVE"
+              COUNT="$ACTIVE"
+            else
+              COUNT="$REQUESTED"
+            fi
+          fi
+
+          if [ "$COUNT" -lt 1 ]; then
+            echo "❌ No active pages found in the sheet — nothing to run"
             exit 1
           fi
+
           IDX=$(seq 0 $((COUNT - 1)) | jq -R . | jq -sc .)
           echo "matrix=$IDX" >> "$GITHUB_OUTPUT"
           echo "Job indices for this run: $IDX"
 
   # ────────────────────────────────────────────────────────────────────────
   # STAGE 2 — one real job per matrix entry, each its own runner/process.
-  # Each job pins to REPO_ID = "<repo>-job<N>", so the AssignedRepo column
-  # in the sheet sticks that same job-slot to the same page on every future
-  # scheduled run. fail-fast: false so one page's job crashing doesn't
-  # cancel the others.
+  # Page selection inside fbpost.py is purely positional: matrix job N
+  # takes whichever Active page sits at position N in the Pages tab.
+  # fail-fast: false so one page's job crashing doesn't cancel the others.
   # ────────────────────────────────────────────────────────────────────────
   upload-reel:
     needs: prepare
@@ -91,7 +139,7 @@ jobs:
           RCLONE_CONF_MEGA:        ${{ secrets.RCLONE_CONF_MEGA }}
           GH_PAT:                  ${{ secrets.GH_PAT }}
         run: |
-          echo "🧩 Job index: ${{ matrix.job_index }} / total: ${{ inputs.job_count }}"
+          echo "🧩 Job index: ${{ matrix.job_index }} / requested job_count: '${{ inputs.job_count }}' (blank = all active pages)"
           for VAR_NAME in GOOGLE_CREDENTIALS_JSON RCLONE_CONF_MEGA; do
             VAL="${!VAR_NAME}"
             if [ -n "$VAL" ]; then echo "✅ $VAR_NAME is set"; else echo "❌ $VAR_NAME is MISSING"; fi
@@ -103,11 +151,11 @@ jobs:
           fi
 
       # ── Run this job's page-slot loop ─────────────────────────────────
-      # REPO_ID pins this matrix job to a stable slot ("<repo>-job0",
-      # "<repo>-job1", ...) so the SAME job index reclaims the SAME page
-      # every scheduled run. No --once flag — the script itself loops on
-      # its own LoopIntervalMinutes/MaxRuntimeMinutes read from the sheet,
-      # posting repeatedly until the runtime window closes.
+      # No --once flag — the script itself loops on its own
+      # LoopIntervalMinutes/MaxRuntimeMinutes read from the sheet, posting
+      # repeatedly until the runtime window closes. Page selection is
+      # purely positional (JOB_INDEX into the Active pages list) — no
+      # assignment/lock column, so nothing needs to be pinned per repo.
       - name: Run page loop (job ${{ matrix.job_index }})
         env:
           TZ:                      "Asia/Karachi"
@@ -117,13 +165,13 @@ jobs:
           GH_PAT:                  ${{ secrets.GH_PAT }}
           JOB_INDEX:               ${{ matrix.job_index }}
           JOB_COUNT:               ${{ inputs.job_count }}
-          REPO_ID:                 "${{ github.repository }}-job${{ matrix.job_index }}"
+          JOB_LIMIT:               ${{ inputs.job_count }}
           # Must match the actual filename of this workflow under .github/workflows/
           GITHUB_WORKFLOW_FILE:    "facebook-reel-upload-loop.yml"
         run: |
-          echo "🔁 Job-slot $REPO_ID starting — continuous loop, timing from the sheet"
+          echo "🔁 Job index ${{ matrix.job_index }} starting — continuous loop, timing from the sheet"
           python fbpost.py
-          echo "⏹️  Job-slot $REPO_ID window finished"
+          echo "⏹️  Job index ${{ matrix.job_index }} window finished"
 
       - name: Upload screenshots & debug files (job ${{ matrix.job_index }})
         if: always()
@@ -141,6 +189,9 @@ jobs:
       # Normally fbpost.py's job-0 process already dispatched the next
       # run itself (writes a .requeued marker). Every other job index
       # skips this entirely, so you never get duplicate re-dispatches.
+      # job_count is re-sent AS-IS (including blank), so a blank run
+      # keeps re-evaluating "all active pages" on every future cycle
+      # instead of freezing at whatever count happened to exist once.
       - name: Self-requeue workflow (fallback, job 0 only)
         if: always() && matrix.job_index == '0'
         env:
