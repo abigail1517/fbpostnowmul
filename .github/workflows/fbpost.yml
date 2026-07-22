@@ -1,0 +1,164 @@
+name: Facebook Reel Upload (Multi-Job Matrix)
+
+on:
+  workflow_dispatch:
+    inputs:
+      captions_sheet_id:
+        description: "Google Sheet ID (defaults to the shared sheet if left blank)"
+        required: false
+        default: "1aAwd5dY5aozXDtqYZK_SNpd7-mIlZFCndJHZ8A0-lIg"
+        type: string
+      job_count:
+        description: "How many pages/jobs to run in parallel this cycle"
+        required: false
+        default: "3"
+        type: string
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────
+  # STAGE 1 — build the matrix [0,1,2,...,job_count-1] from the input.
+  # This is what lets you control "how many jobs" purely via a number,
+  # instead of hard-coding a matrix list in the YAML.
+  # ────────────────────────────────────────────────────────────────────────
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+    steps:
+      - name: Build job-index matrix
+        id: build
+        run: |
+          COUNT="${{ inputs.job_count }}"
+          if ! [[ "$COUNT" =~ ^[0-9]+$ ]] || [ "$COUNT" -lt 1 ]; then
+            echo "❌ job_count must be a positive integer, got '$COUNT'"
+            exit 1
+          fi
+          IDX=$(seq 0 $((COUNT - 1)) | jq -R . | jq -sc .)
+          echo "matrix=$IDX" >> "$GITHUB_OUTPUT"
+          echo "Job indices for this run: $IDX"
+
+  # ────────────────────────────────────────────────────────────────────────
+  # STAGE 2 — one real job per matrix entry, each its own runner/process.
+  # Each job pins to REPO_ID = "<repo>-job<N>", so the AssignedRepo column
+  # in the sheet sticks that same job-slot to the same page on every future
+  # scheduled run. fail-fast: false so one page's job crashing doesn't
+  # cancel the others.
+  # ────────────────────────────────────────────────────────────────────────
+  upload-reel:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        job_index: ${{ fromJson(needs.prepare.outputs.matrix) }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          pip install playwright \
+                      google-auth google-auth-httplib2 google-api-python-client
+          playwright install chromium --with-deps
+
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      - name: Configure rclone (Mega.nz remote)
+        env:
+          RCLONE_CONF_MEGA: ${{ secrets.RCLONE_CONF_MEGA }}
+        run: |
+          if [ -z "$RCLONE_CONF_MEGA" ]; then
+            echo "❌ RCLONE_CONF_MEGA secret is not set"
+            exit 1
+          fi
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF_MEGA" > ~/.config/rclone/rclone.conf
+          rclone listremotes
+
+      - name: Verify required secrets
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          RCLONE_CONF_MEGA:        ${{ secrets.RCLONE_CONF_MEGA }}
+          GH_PAT:                  ${{ secrets.GH_PAT }}
+        run: |
+          echo "🧩 Job index: ${{ matrix.job_index }} / total: ${{ inputs.job_count }}"
+          for VAR_NAME in GOOGLE_CREDENTIALS_JSON RCLONE_CONF_MEGA; do
+            VAL="${!VAR_NAME}"
+            if [ -n "$VAL" ]; then echo "✅ $VAR_NAME is set"; else echo "❌ $VAR_NAME is MISSING"; fi
+          done
+          if [ -n "$GH_PAT" ]; then
+            echo "✅ GH_PAT is set — only job 0 will self-requeue the next cycle"
+          else
+            echo "⚠️  GH_PAT is NOT set — no auto-requeue, loop stops after this cycle"
+          fi
+
+      # ── Run this job's page-slot loop ─────────────────────────────────
+      # REPO_ID pins this matrix job to a stable slot ("<repo>-job0",
+      # "<repo>-job1", ...) so the SAME job index reclaims the SAME page
+      # every scheduled run. No --once flag — the script itself loops on
+      # its own LoopIntervalMinutes/MaxRuntimeMinutes read from the sheet,
+      # posting repeatedly until the runtime window closes.
+      - name: Run page loop (job ${{ matrix.job_index }})
+        env:
+          TZ:                      "Asia/Karachi"
+          FB_STORAGE_STATE:        ${{ secrets.FB_STORAGE_STATE }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          CAPTIONS_SHEET_ID:       ${{ inputs.captions_sheet_id }}
+          GH_PAT:                  ${{ secrets.GH_PAT }}
+          JOB_INDEX:               ${{ matrix.job_index }}
+          JOB_COUNT:               ${{ inputs.job_count }}
+          REPO_ID:                 "${{ github.repository }}-job${{ matrix.job_index }}"
+          # Must match the actual filename of this workflow under .github/workflows/
+          GITHUB_WORKFLOW_FILE:    "facebook-reel-upload-loop.yml"
+        run: |
+          echo "🔁 Job-slot $REPO_ID starting — continuous loop, timing from the sheet"
+          python fbpost.py
+          echo "⏹️  Job-slot $REPO_ID window finished"
+
+      - name: Upload screenshots & debug files (job ${{ matrix.job_index }})
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reel-upload-result-${{ github.run_number }}-job${{ matrix.job_index }}
+          path: |
+            *.png
+            screenshots/*.png
+            *.html
+          retention-days: 7
+          if-no-files-found: warn
+
+      # ── Fallback self-requeue — job 0 ONLY ─────────────────────────────
+      # Normally fbpost.py's job-0 process already dispatched the next
+      # run itself (writes a .requeued marker). Every other job index
+      # skips this entirely, so you never get duplicate re-dispatches.
+      - name: Self-requeue workflow (fallback, job 0 only)
+        if: always() && matrix.job_index == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -f .requeued ]; then
+            echo "✅ Already requeued early from inside the Python run — skipping fallback"
+            exit 0
+          fi
+          if [ -z "$GH_TOKEN" ]; then
+            echo "⚠️  GH_PAT not set — self-requeue skipped (loop will not continue)"
+            exit 0
+          fi
+          echo "🔄 Fallback requeue (python didn't get to it) …"
+          gh workflow run \
+            "${{ github.workflow }}" \
+            --repo "${{ github.repository }}" \
+            --ref "${{ github.ref_name }}" \
+            --field captions_sheet_id="${{ inputs.captions_sheet_id }}" \
+            --field job_count="${{ inputs.job_count }}"
+          echo "✅ Next job queued"
