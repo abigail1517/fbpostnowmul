@@ -38,7 +38,11 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          pip install google-auth google-auth-httplib2 google-api-python-client
+          # playwright is imported at module load time by fbpost.py even
+          # though --count-pages never launches a browser, so the package
+          # (but not the browser binaries) is needed here too.
+          pip install playwright \
+                      google-auth google-auth-httplib2 google-api-python-client
 
       - name: Count active pages in sheet
         id: count
