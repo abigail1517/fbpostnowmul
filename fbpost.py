@@ -74,7 +74,13 @@ Active rows) — there is no assignment/lock column any more.
     Caption              override — the WITH-link caption for "rotation" mode
     WithoutLinkCap        override — the WITHOUT-link caption for "rotation" mode
     Link_Percentage      override
-    LoopIntervalMinutes  override
+    LoopIntervalMinutes  override — base minutes between posts (used as the center point
+                          for auto-randomization if Min/Max below are left blank)
+    LoopIntervalMinMinutes override — explicit floor for the random per-cycle wait (optional)
+    LoopIntervalMaxMinutes override — explicit ceiling for the random per-cycle wait (optional).
+                          If both Min/Max are blank, the script auto-derives a ±25% random
+                          range around LoopIntervalMinutes, so every cycle waits a
+                          different, human-like amount of time instead of one fixed interval.
     UrlReplaceCount      override
     UrlReplaceMode       override
     UrlReplaceEnabled    override
@@ -162,6 +168,8 @@ POSTQUEUE_TAB  = "PostQueue"
 
 SETTINGS_DEFAULTS = {
     "loopintervalminutes":    "60",
+    "loopintervalminminutes": "",     # optional explicit override — blank = auto-derive ±25% of LoopIntervalMinutes
+    "loopintervalmaxminutes": "",     # optional explicit override — blank = auto-derive ±25% of LoopIntervalMinutes
     "maxruntimeminutes":      "300",
     "megafolder":             "fbreels",
     "megamovefolder":         "fbreels_uploaded",
@@ -180,7 +188,8 @@ SETTINGS_DEFAULTS = {
 
 PAGES_HEADERS = [
     "PageId", "PageName", "PageActualId", "Status", "MegaFolder", "MegaMoveFolder", "Caption",
-    "WithoutLinkCap", "Link_Percentage", "LoopIntervalMinutes", "UrlReplaceCount",
+    "WithoutLinkCap", "Link_Percentage", "LoopIntervalMinutes", "LoopIntervalMinMinutes",
+    "LoopIntervalMaxMinutes", "UrlReplaceCount",
     "UrlReplaceMode", "UrlReplaceEnabled", "UrlSwapOnRejectOnly", "PostMode", "FbStorageState",
     "LastPostedFile", "Notes",
 ]
@@ -398,7 +407,7 @@ def setup_sheet(sheets_service, spreadsheet_id):
     sh.ensure_tab(PAGES_TAB, PAGES_HEADERS)
     sh.ensure_tab(URLS_TAB, URLS_HEADERS)
     sh.ensure_tab(POSTQUEUE_TAB, POSTQUEUE_HEADERS)
-    sh.ensure_columns(PAGES_TAB, ["PageActualId"])
+    sh.ensure_columns(PAGES_TAB, ["PageActualId", "LoopIntervalMinMinutes", "LoopIntervalMaxMinutes"])
 
     settings_rows, _ = sh.as_dicts(SETTINGS_TAB)
     present_keys = {r.get("Key", "").strip().lower() for r in settings_rows}
@@ -458,6 +467,8 @@ class PageConfig:
     without_link_caption: str
     link_percentage: int
     loop_interval_minutes: int
+    loop_interval_min_minutes: int
+    loop_interval_max_minutes: int
     url_replace_count: int
     url_replace_mode: str
     url_replace_enabled: bool
@@ -471,7 +482,30 @@ class PageConfig:
     delay_max_seconds: float
 
 
+def _derive_loop_interval_range(row: dict, master: dict) -> tuple[int, int]:
+    """Returns (min_minutes, max_minutes) for the randomized per-cycle wait.
+    If LoopIntervalMinMinutes/MaxMinutes are explicitly set (page override or
+    Settings), those are used as-is. Otherwise, auto-derives a ±25% spread
+    around the base LoopIntervalMinutes value, so posting always waits a
+    different, human-like amount of time each cycle instead of one fixed
+    interval — no extra sheet configuration required."""
+    base = _to_int(effective(row, master, "loopintervalminutes", "LoopIntervalMinutes"), 60)
+    min_raw = effective(row, master, "loopintervalminminutes", "LoopIntervalMinMinutes").strip()
+    max_raw = effective(row, master, "loopintervalmaxminutes", "LoopIntervalMaxMinutes").strip()
+    if min_raw or max_raw:
+        lo = _to_int(min_raw, base)
+        hi = _to_int(max_raw, base)
+    else:
+        spread = max(1, round(base * 0.25))
+        lo = max(1, base - spread)
+        hi = base + spread
+    if hi < lo:
+        lo, hi = hi, lo
+    return lo, hi
+
+
 def build_page_config(row: dict, master: dict, max_runtime_minutes: int) -> PageConfig:
+    loop_min, loop_max = _derive_loop_interval_range(row, master)
     return PageConfig(
         page_id=row["PageId"],
         page_name=row.get("PageName") or row["PageId"],
@@ -483,6 +517,8 @@ def build_page_config(row: dict, master: dict, max_runtime_minutes: int) -> Page
         without_link_caption=row.get("WithoutLinkCap", ""),
         link_percentage=max(0, min(100, _to_int(effective(row, master, "link_percentage", "Link_Percentage"), 100))),
         loop_interval_minutes=_to_int(effective(row, master, "loopintervalminutes", "LoopIntervalMinutes"), 60),
+        loop_interval_min_minutes=loop_min,
+        loop_interval_max_minutes=loop_max,
         url_replace_count=_to_int(effective(row, master, "urlreplacecount", "UrlReplaceCount"), 1),
         url_replace_mode=(effective(row, master, "urlreplacemode", "UrlReplaceMode") or "unique").lower(),
         url_replace_enabled=_to_bool(effective(row, master, "urlreplaceenabled", "UrlReplaceEnabled"), True),
@@ -1429,7 +1465,12 @@ class PageWorker:
                         info(cfg.page_id, f"Runtime window ({cfg.max_runtime_minutes}m) reached — stopping")
                         break
 
-                    remaining = cfg.loop_interval_minutes * 60
+                    next_interval_min = random.randint(
+                        cfg.loop_interval_min_minutes, cfg.loop_interval_max_minutes
+                    ) if cfg.loop_interval_max_minutes > cfg.loop_interval_min_minutes else cfg.loop_interval_min_minutes
+                    info(cfg.page_id, f"⏲️  Next post in ~{next_interval_min}m "
+                                       f"(random range {cfg.loop_interval_min_minutes}-{cfg.loop_interval_max_minutes}m)")
+                    remaining = next_interval_min * 60
                     while remaining > 0:
                         chunk = min(remaining, cfg.heartbeat_minutes * 60)
                         await asyncio.sleep(chunk)
