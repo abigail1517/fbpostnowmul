@@ -174,6 +174,8 @@ SETTINGS_DEFAULTS = {
                                         # sheet while a page's job is actively running
     "linkrejectmaxretries":   "2",
     "urlswaponrejectonly":    "FALSE",
+    "mindelayseconds":        "2.5",   # random human-like pause floor between actions/steps
+    "maxdelayseconds":        "7",     # random human-like pause ceiling between actions/steps
 }
 
 PAGES_HEADERS = [
@@ -227,6 +229,13 @@ def _to_bool(val, default):
     if val is None or str(val).strip() == "":
         return default
     return str(val).strip().lower() in ("true", "yes", "y", "1", "on", "enable", "enabled")
+
+
+def _to_float(val, default):
+    try:
+        return float(str(val).strip())
+    except (TypeError, ValueError):
+        return default
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -458,6 +467,8 @@ class PageConfig:
     max_runtime_minutes: int
     heartbeat_minutes: int
     link_reject_max_retries: int
+    delay_min_seconds: float
+    delay_max_seconds: float
 
 
 def build_page_config(row: dict, master: dict, max_runtime_minutes: int) -> PageConfig:
@@ -481,6 +492,8 @@ def build_page_config(row: dict, master: dict, max_runtime_minutes: int) -> Page
         max_runtime_minutes=max_runtime_minutes,
         heartbeat_minutes=_to_int(master.get("heartbeatminutes"), 15),
         link_reject_max_retries=_to_int(master.get("linkrejectmaxretries"), 2),
+        delay_min_seconds=max(0.3, _to_float(master.get("mindelayseconds"), 2.5)),
+        delay_max_seconds=max(0.6, _to_float(master.get("maxdelayseconds"), 7)),
     )
 
 
@@ -841,6 +854,54 @@ async def save_screenshot(page_id, page, name: str):
         warn(page_id, f"Screenshot failed: {e}")
 
 
+# ── Human-like pacing helpers ───────────────────────────────────────────────
+# These exist purely so the automation doesn't click/type/upload at
+# machine speed with zero variance. Ranges come from the sheet's
+# Settings.MinDelaySeconds / MaxDelaySeconds (defaults 2.5–7s), scaled by a
+# per-call `weight` so short UI waits and long "reading the page" waits
+# both feel natural without needing separate config knobs.
+
+async def human_delay(cfg: "PageConfig", page_id: str = None, weight: float = 1.0, label: str = None):
+    lo = max(0.2, cfg.delay_min_seconds * weight)
+    hi = max(lo + 0.4, cfg.delay_max_seconds * weight)
+    d = random.uniform(lo, hi)
+    if label:
+        info(page_id, f"⏳ pausing ~{d:.1f}s ({label})")
+    await asyncio.sleep(d)
+    return d
+
+
+async def human_mouse_move(page_id, page, moves: int = None):
+    """Glides the mouse through a few random intermediate points instead of
+    teleporting the cursor, and pauses briefly between glides."""
+    try:
+        vp = page.viewport_size or {"width": 1280, "height": 900}
+        moves = moves or random.randint(2, 5)
+        for _ in range(moves):
+            x = random.randint(40, max(41, vp["width"] - 40))
+            y = random.randint(40, max(41, vp["height"] - 40))
+            await page.mouse.move(x, y, steps=random.randint(12, 30))
+            await asyncio.sleep(random.uniform(0.15, 0.5))
+    except Exception:
+        pass  # purely cosmetic — never let this break the actual flow
+
+
+async def human_scroll(page_id, page, passes: int = None):
+    """Scrolls the page in a few small, slightly uneven steps (with an
+    occasional tiny scroll-back) rather than one abrupt jump."""
+    try:
+        passes = passes or random.randint(2, 4)
+        for _ in range(passes):
+            if random.random() < 0.15:
+                dy = -random.randint(80, 220)   # small human "oops, scroll back up"
+            else:
+                dy = random.randint(150, 480)
+            await page.mouse.wheel(0, dy)
+            await asyncio.sleep(random.uniform(0.25, 0.85))
+    except Exception:
+        pass
+
+
 async def nuke_continue_button(page_id, page) -> bool:
     SELECTORS = [
         '[aria-label^="Continue"]', '[aria-label*="Continue"]',
@@ -919,6 +980,13 @@ async def ensure_logged_in(page_id, page) -> bool:
 
 def _nonempty_lines(text: str) -> list[str]:
     return [l for l in text.split("\n") if l.strip()]
+
+
+def _caption_preview(caption: str, limit: int = 160) -> str:
+    flat = " ".join(caption.split())
+    if len(flat) <= limit:
+        return flat if flat else "(empty)"
+    return flat[:limit].rstrip() + "…"
 
 
 async def _clear_field(page, field):
@@ -1023,9 +1091,16 @@ async def detect_link_rejection(page_id, page) -> bool:
     return False
 
 
-async def run_upload_flow(page_id, page, caption: str, video_path: str) -> dict:
+async def run_upload_flow(page_id, page, caption: str, video_path: str, cfg: "PageConfig") -> dict:
     published = False
     link_rejected = False
+    file_label = os.path.basename(video_path)
+
+    print(f"┌────────────────────────────────────────────────────────────")
+    print(f"│ ▶️  UPLOAD CYCLE — page: {page_id}")
+    print(f"│    file:    {file_label}")
+    print(f"│    caption: {_caption_preview(caption)}")
+    print(f"└────────────────────────────────────────────────────────────")
 
     step(page_id, "Loading Facebook homepage")
     try:
@@ -1033,11 +1108,14 @@ async def run_upload_flow(page_id, page, caption: str, video_path: str) -> dict:
     except Exception as e:
         fail(page_id, f"Page load failed: {e}")
         return {"published": False, "link_rejected": False}
-    await asyncio.sleep(8)
+    await human_delay(cfg, page_id, weight=1.6, label="letting the homepage settle")
+    await human_mouse_move(page_id, page)
+    await human_scroll(page_id, page)
 
     if not await ensure_logged_in(page_id, page):
         return {"published": False, "link_rejected": False}
     ok(page_id, "Login confirmed")
+    await human_delay(cfg, page_id, weight=0.6)
 
     step(page_id, "Navigating to Reels create")
     try:
@@ -1045,7 +1123,8 @@ async def run_upload_flow(page_id, page, caption: str, video_path: str) -> dict:
     except Exception as e:
         fail(page_id, f"Nav to reels/create failed: {e}")
         return {"published": False, "link_rejected": False}
-    await asyncio.sleep(8)
+    await human_delay(cfg, page_id, weight=1.4, label="letting the Reels composer load")
+    await human_mouse_move(page_id, page)
 
     step(page_id, "Attaching video")
     uploaded = False
@@ -1084,6 +1163,8 @@ async def run_upload_flow(page_id, page, caption: str, video_path: str) -> dict:
         await save_screenshot(page_id, page, "no_upload")
         return {"published": False, "link_rejected": False}
     ok(page_id, "Video attached")
+    await human_delay(cfg, page_id, weight=1.8, label="letting the video finish processing")
+    await human_scroll(page_id, page)
 
     step(page_id, "Waiting for Next to become active")
     next_selectors = ['div[aria-label="Next"][role="button"]', 'div[role="button"]:has-text("Next")',
@@ -1141,11 +1222,16 @@ async def run_upload_flow(page_id, page, caption: str, video_path: str) -> dict:
                 caption_found = True; break
             await asyncio.sleep(2)
 
-    step(page_id, "Entering caption")
+    await human_mouse_move(page_id, page)
+    await human_delay(cfg, page_id, weight=0.9, label="pausing before typing the caption")
+    step(page_id, f"Entering caption: {_caption_preview(caption)}")
     caption_ok = await enter_caption_lexical(page_id, page, caption)
-    if not caption_ok:
+    if caption_ok:
+        ok(page_id, f"Caption confirmed on page: {_caption_preview(caption)}")
+    else:
         warn(page_id, "Caption entry unverified — continuing anyway")
     await save_screenshot(page_id, page, "after_caption")
+    await human_delay(cfg, page_id, weight=0.7, label="re-reading the caption before posting")
 
     step(page_id, "Advancing to Post panel")
 
@@ -1173,6 +1259,8 @@ async def run_upload_flow(page_id, page, caption: str, video_path: str) -> dict:
             except Exception:
                 pass
 
+    await human_mouse_move(page_id, page)
+    await human_delay(cfg, page_id, weight=1.1, label="one last pause before hitting Post")
     step(page_id, "Clicking Post / Publish")
     post_selectors = [
         'div[aria-label="Post"][role="button"]', 'div[role="button"]:text-is("Post")',
@@ -1235,6 +1323,13 @@ async def run_upload_flow(page_id, page, caption: str, video_path: str) -> dict:
             pass
 
     await save_screenshot(page_id, page, "final_result")
+    result_line = "✅ PUBLISHED" if published else ("🚫 REJECTED (link)" if link_rejected else "❌ NOT CONFIRMED")
+    print(f"┌────────────────────────────────────────────────────────────")
+    print(f"│ 🏁 RESULT — page: {page_id}")
+    print(f"│    file:      {file_label}")
+    print(f"│    caption:   {_caption_preview(caption)}")
+    print(f"│    published: {result_line}")
+    print(f"└────────────────────────────────────────────────────────────")
     if published:
         ok(page_id, "🎉 Published")
     else:
@@ -1250,8 +1345,14 @@ class PageWorker:
     """One Facebook Page, handled by exactly one matrix job (its JOB_INDEX
     position in the Active pages list). Keeps a single browser context OPEN
     for the whole run and periodically refreshes FbStorageState back to the
-    sheet so the login session never goes stale, and syncs PageName from
-    Facebook (via PageActualId) once at startup.
+    sheet so the login session never goes stale.
+
+    Does NOT scrape/sync the page's display name or id from Facebook — this
+    worker's only job is posting reels. Before every single post cycle it
+    re-reads Settings + this page's row fresh from Google Sheets (see
+    _refresh_config), so a caption/folder/link%/delay edit you make in the
+    sheet while the workflow is already running is picked up on the very
+    next cycle — no restart needed.
 
     No assignment/lock columns, no semaphore / thread-count gating —
     concurrency across pages is achieved purely by running separate GitHub
@@ -1305,12 +1406,19 @@ class PageWorker:
                 await self.browser.close()
                 return
 
-            await self._sync_page_name()
-
             last_heartbeat = time.monotonic()
             try:
                 while True:
-                    await self._post_once()
+                    status = await self._refresh_config()
+                    cfg = self.cfg   # local alias may now point to a fresh object — re-bind
+
+                    if status == "paused":
+                        info(cfg.page_id, "Page is Paused in the sheet — skipping this cycle's post")
+                    elif status == "missing":
+                        warn(cfg.page_id, "This page's row is no longer in the sheet — skipping this cycle's post")
+                    else:
+                        await self._post_once()
+
                     await self._heartbeat()
                     last_heartbeat = time.monotonic()
 
@@ -1335,33 +1443,30 @@ class PageWorker:
                 await self.browser.close()
                 ok(cfg.page_id, "Browser closed — cycle finished")
 
-    async def _sync_page_name(self):
-        """Visits the page's public profile URL (built from PageActualId)
-        once at startup and scrapes its current display name into the
-        PageName cell, so the sheet always shows which row is which page
-        without you having to type it in or keep it updated by hand."""
-        cfg = self.cfg
-        if not cfg.page_actual_id:
-            info(cfg.page_id, "No PageActualId set — skipping page-name sync")
-            return
-        name_col = self.col_index.get("pagename")
+    async def _refresh_config(self) -> str:
+        """Re-reads 'Settings' + this page's row in 'Pages' fresh from
+        Google Sheets and rebuilds self.cfg from scratch. Called at the
+        start of EVERY post cycle (not just at startup) so that captions,
+        folders, link %, URL-replace settings, delay ranges, etc. edited in
+        the sheet mid-run are picked up on the very next cycle — never the
+        stale, first-loaded values.
+        Returns "ok", "paused", or "missing"."""
+        pid = self.cfg.page_id
         try:
-            page = await self.context.new_page()
-            url = f"https://www.facebook.com/profile.php?id={cfg.page_actual_id}"
-            await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-            await asyncio.sleep(4)
-            name = await page.evaluate("""() => {
-                const og = document.querySelector('meta[property="og:title"]');
-                if (og && og.content) return og.content.trim();
-                return (document.title || '').replace(/\\s*\\|\\s*Facebook.*$/i, '').trim();
-            }""")
-            await page.close()
-            if name and name_col is not None and name != cfg.page_name:
-                self.sh.write_cell(PAGES_TAB, cfg.row_num, name_col, name)
-                ok(cfg.page_id, f"Synced PageName from Facebook: '{name}' (PageActualId={cfg.page_actual_id})")
-                cfg.page_name = name
+            master = load_master_settings(self.sh)
+            rows, _ = self.sh.as_dicts(PAGES_TAB)
+            row = next((r for r in rows if r.get("PageId", "").strip() == pid), None)
+            if row is None:
+                return "missing"
+            if (row.get("Status", "") or "Active").strip().lower() == "paused":
+                return "paused"
+            self.col_index = get_pages_col_index(self.sh)
+            self.cfg = build_page_config(row, master, self.cfg.max_runtime_minutes)
+            info(pid, "🔄 Reloaded latest Settings + Pages row from Google Sheet for this cycle")
+            return "ok"
         except Exception as e:
-            warn(cfg.page_id, f"Could not sync page name for PageActualId={cfg.page_actual_id}: {e}")
+            warn(pid, f"Could not refresh config from sheet this cycle (using last-known values): {e}")
+            return "ok"
 
     async def _heartbeat(self):
         cfg = self.cfg
@@ -1375,6 +1480,7 @@ class PageWorker:
     async def _post_once(self):
         cfg = self.cfg
         pid = cfg.page_id
+        print(f"\n══════════════════════ [{pid}] NEW POST CYCLE — {now_iso()} ══════════════════════")
         step(pid, f"Post cycle starting (mode={cfg.post_mode})")
         info(pid, f"Resolved settings: UrlReplaceEnabled={cfg.url_replace_enabled}, "
                   f"UrlSwapOnRejectOnly={cfg.url_swap_on_reject_only}, "
@@ -1490,7 +1596,7 @@ class PageWorker:
             for attempt in range(1, max_attempts + 1):
                 try:
                     page = await self.context.new_page()
-                    result = await run_upload_flow(pid, page, caption, local_path)
+                    result = await run_upload_flow(pid, page, caption, local_path, cfg)
                     await page.close()
                 except Exception as e:
                     fail(pid, f"Upload flow crashed: {e}")
